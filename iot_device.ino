@@ -1,0 +1,359 @@
+#include <ESP8266WiFi.h>
+
+#include "config_manager.h"
+#include "funtion_manager.h"
+#include "mqtt_manager.h"
+#include "provisioning_portal.h"
+#include "reset_manager.h"
+
+namespace {
+
+enum SystemState {
+  STATE_BOOT,
+  STATE_PROVISIONING,
+  STATE_WIFI_CONNECTING,
+  STATE_MQTT_CONNECTING,
+  STATE_RUNNING
+};
+
+constexpr unsigned long kWifiConnectTimeoutMs = 20000;
+constexpr uint8_t kMaxWifiAttempts = 2;
+constexpr unsigned long kStatusLogIntervalMs = 5000;
+constexpr bool kForceProvisioningModeOnBoot = false;
+constexpr unsigned long kConfigApplyRestartDelayMs = 1000;
+constexpr unsigned long kFactoryModeArmDelayMs = 10000;
+constexpr char kFactoryModeTopic[] = "iot_dev/factory_mode";
+constexpr char kFactoryModeCommand[] = "set";
+constexpr uint8_t kFactoryResetButtonPin = 14;
+constexpr bool kFactoryResetButtonActiveLow = true;
+constexpr unsigned long kFactoryResetHoldMs = 5000;
+
+ConfigManager configManager;
+FunctionManager functionManager;
+ProvisioningPortal portal;
+MqttManager mqttManager;
+ResetManager resetManager;
+device_config::DeviceConfig deviceConfig;
+SystemState systemState = STATE_BOOT;
+uint8_t wifiAttemptCount = 0;
+unsigned long wifiAttemptStartedMs = 0;
+unsigned long lastStatusLogMs = 0;
+bool factoryResetPending = false;
+String factoryResetReason;
+bool configApplyPending = false;
+unsigned long configApplyRestartAtMs = 0;
+unsigned long factoryModeArmedAtMs = 0;
+
+String buildAccessPointSsid() {
+  String ssid = F("DEVICE_SETUP_");
+  ssid += String(ESP.getChipId(), HEX);
+  ssid.toUpperCase();
+  return ssid;
+}
+
+void requestFactoryReset(const String &reason) {
+  if (factoryResetPending) {
+    return;
+  }
+
+  factoryResetPending = true;
+  factoryResetReason = reason;
+  Serial.printf("Factory reset requested: %s\n", factoryResetReason.c_str());
+}
+
+void performFactoryReset() {
+  factoryResetPending = false;
+
+  Serial.printf("Performing factory reset: %s\n", factoryResetReason.c_str());
+  mqttManager.disconnect();
+  portal.stop();
+  WiFi.disconnect(true);
+
+  if (!configManager.clear()) {
+    Serial.println(F("Failed to clear configuration from EEPROM."));
+  } else {
+    Serial.println(F("Configuration cleared. Restarting into provisioning mode."));
+  }
+
+  delay(300);
+  ESP.restart();
+}
+
+void scheduleConfigApplyRestart() {
+  configApplyPending = true;
+  configApplyRestartAtMs = millis() + kConfigApplyRestartDelayMs;
+  Serial.println(F("Configuration saved. Restarting to apply new settings."));
+}
+
+void handleMqttMessage(char *topic, uint8_t *payload, unsigned int length) {
+  if (topic == nullptr) {
+    return;
+  }
+
+  String command;
+  command.reserve(length);
+  for (unsigned int index = 0; index < length; ++index) {
+    command += static_cast<char>(payload[index]);
+  }
+  command.trim();
+  command.toLowerCase();
+
+  Serial.printf("MQTT message received on '%s': '%s'\n", topic, command.c_str());
+
+  if (strcmp(topic, kFactoryModeTopic) == 0) {
+    if (static_cast<long>(millis() - factoryModeArmedAtMs) < 0) {
+      Serial.println(F("Ignoring early factory mode command during MQTT startup grace period."));
+      if (!mqttManager.publish(kFactoryModeTopic, "", true)) {
+        Serial.println(F("Warning: failed to clear stale retained factory reset command."));
+      }
+      return;
+    }
+
+    if (command == kFactoryModeCommand) {
+      // Clear a retained reset command so it does not trigger again
+      // after the device reconnects to MQTT with new settings.
+      if (!mqttManager.publish(kFactoryModeTopic, "", true)) {
+        Serial.println(F("Warning: failed to clear retained factory reset command."));
+      }
+      requestFactoryReset(F("MQTT factory mode topic"));
+    } else {
+      Serial.println(F("Unsupported factory command. Use 'set'."));
+    }
+    return;
+  }
+
+  functionManager.handleMqttCommand(topic, command);
+}
+
+void setState(SystemState newState) {
+  if (systemState == newState) {
+    return;
+  }
+
+  systemState = newState;
+  Serial.printf("State changed to %d\n", static_cast<int>(systemState));
+}
+
+void startProvisioningMode() {
+  mqttManager.disconnect();
+  wifiAttemptCount = 0;
+  wifiAttemptStartedMs = 0;
+
+  const String apSsid = buildAccessPointSsid();
+  if (!portal.begin(apSsid)) {
+    Serial.println(F("Failed to start provisioning portal, rebooting in 2 seconds."));
+    delay(2000);
+    ESP.restart();
+  }
+
+  Serial.printf("Provisioning portal active. Connect to '%s' and open http://%s/\n",
+                portal.accessPointSsid().c_str(), WiFi.softAPIP().toString().c_str());
+  setState(STATE_PROVISIONING);
+}
+
+void beginWifiAttempt() {
+  if (wifiAttemptCount >= kMaxWifiAttempts) {
+    Serial.println(F("Wi-Fi retry limit reached, returning to provisioning mode."));
+    startProvisioningMode();
+    return;
+  }
+
+  ++wifiAttemptCount;
+  wifiAttemptStartedMs = millis();
+
+  WiFi.softAPdisconnect(true);
+  WiFi.mode(WIFI_STA);
+  WiFi.persistent(false);
+  WiFi.setAutoReconnect(true);
+  WiFi.disconnect();
+  delay(100);
+  WiFi.begin(deviceConfig.wifiSsid, deviceConfig.wifiPassword);
+
+  Serial.printf("Connecting to Wi-Fi '%s' (attempt %u/%u)\n", deviceConfig.wifiSsid,
+                wifiAttemptCount, kMaxWifiAttempts);
+  setState(STATE_WIFI_CONNECTING);
+}
+
+void startWifiConnectionFlow() {
+  portal.stop();
+  mqttManager.disconnect();
+  beginWifiAttempt();
+}
+
+void serviceWifiConnect() {
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial.printf("Wi-Fi connected. IP address: %s\n", WiFi.localIP().toString().c_str());
+    mqttManager.configure(deviceConfig);
+    setState(STATE_MQTT_CONNECTING);
+    return;
+  }
+
+  if (millis() - wifiAttemptStartedMs >= kWifiConnectTimeoutMs) {
+    Serial.println(F("Wi-Fi connection attempt timed out."));
+    beginWifiAttempt();
+    return;
+  }
+
+  if (millis() - lastStatusLogMs >= kStatusLogIntervalMs) {
+    lastStatusLogMs = millis();
+    Serial.println(F("Waiting for Wi-Fi connection..."));
+  }
+}
+
+void serviceMqttConnect() {
+  if (WiFi.status() != WL_CONNECTED) {
+    Serial.println(F("Wi-Fi lost before MQTT connection completed. Retrying Wi-Fi."));
+    startWifiConnectionFlow();
+    return;
+  }
+
+  if (mqttManager.ensureConnected()) {
+    if (!mqttManager.subscribe(FunctionManager::blinkLedTopic())) {
+      Serial.printf("MQTT connected, but subscription to '%s' failed.\n",
+                    FunctionManager::blinkLedTopic());
+      return;
+    }
+
+    if (!mqttManager.subscribe(kFactoryModeTopic)) {
+      Serial.printf("MQTT connected, but subscription to '%s' failed.\n",
+                    kFactoryModeTopic);
+      return;
+    }
+
+    Serial.printf("MQTT connected to %s:%u\n", deviceConfig.mqttBroker, deviceConfig.mqttPort);
+    Serial.printf("Subscribed to MQTT topic '%s'\n", FunctionManager::blinkLedTopic());
+    Serial.printf("Subscribed to MQTT topic '%s'\n", kFactoryModeTopic);
+    factoryModeArmedAtMs = millis() + kFactoryModeArmDelayMs;
+    Serial.printf("Factory mode MQTT command will arm in %lu ms\n", kFactoryModeArmDelayMs);
+    setState(STATE_RUNNING);
+    return;
+  }
+
+  if (millis() - lastStatusLogMs >= kStatusLogIntervalMs) {
+    lastStatusLogMs = millis();
+    Serial.printf("Waiting for MQTT broker %s:%u (state=%d)\n", deviceConfig.mqttBroker,
+                  deviceConfig.mqttPort, mqttManager.state());
+  }
+}
+
+void serviceRunning() {
+  if (WiFi.status() != WL_CONNECTED) {
+    Serial.println(F("Wi-Fi disconnected. Restarting Wi-Fi connection flow."));
+    startWifiConnectionFlow();
+    return;
+  }
+
+  if (!mqttManager.connected()) {
+    Serial.println(F("MQTT disconnected. Reconnecting."));
+    setState(STATE_MQTT_CONNECTING);
+    return;
+  }
+
+  mqttManager.loop();
+}
+
+void handleProvisioningSubmission() {
+  if (!portal.hasSubmittedConfig()) {
+    return;
+  }
+
+  device_config::DeviceConfig submittedConfig = portal.takeSubmittedConfig();
+  if (!configManager.save(submittedConfig)) {
+    Serial.println(F("Failed to save configuration to EEPROM."));
+    startProvisioningMode();
+    return;
+  }
+
+  device_config::DeviceConfig verifiedConfig;
+  if (!configManager.load(verifiedConfig)) {
+    Serial.println(F("Saved configuration could not be verified after write."));
+    startProvisioningMode();
+    return;
+  }
+
+  deviceConfig = verifiedConfig;
+  Serial.printf("Configuration saved for SSID '%s' and MQTT broker '%s:%u'\n",
+                deviceConfig.wifiSsid, deviceConfig.mqttBroker, deviceConfig.mqttPort);
+  scheduleConfigApplyRestart();
+}
+
+}  // namespace
+
+void setup() {
+  Serial.begin(115200);
+  delay(200);
+  Serial.println();
+  Serial.println(F("ESP8266 provisioning + MQTT firmware starting..."));
+
+  device_config::clear(deviceConfig);
+  functionManager.begin();
+  resetManager.begin(kFactoryResetButtonPin, kFactoryResetButtonActiveLow,
+                     kFactoryResetHoldMs);
+  mqttManager.setMessageCallback(handleMqttMessage);
+
+  if (!configManager.begin()) {
+    Serial.println(F("EEPROM initialization failed. Rebooting."));
+    delay(2000);
+    ESP.restart();
+  }
+
+  if (!kForceProvisioningModeOnBoot && configManager.load(deviceConfig)) {
+    Serial.printf("Loaded saved config. SSID='%s', MQTT='%s:%u'\n", deviceConfig.wifiSsid,
+                  deviceConfig.mqttBroker, deviceConfig.mqttPort);
+    startWifiConnectionFlow();
+  } else {
+    if (kForceProvisioningModeOnBoot) {
+      Serial.println(F("Force provisioning mode is enabled. Ignoring saved config."));
+    } else {
+      Serial.println(F("No valid saved config found. Starting provisioning mode."));
+    }
+    startProvisioningMode();
+  }
+}
+
+void loop() {
+  resetManager.poll();
+  if (resetManager.consumeFactoryResetRequest()) {
+    requestFactoryReset(F("Physical button hold"));
+  }
+
+  if (factoryResetPending) {
+    performFactoryReset();
+    return;
+  }
+
+  if (configApplyPending &&
+      static_cast<long>(millis() - configApplyRestartAtMs) >= 0) {
+    configApplyPending = false;
+    Serial.println(F("Rebooting now to apply provisioned configuration."));
+    delay(200);
+    ESP.restart();
+    return;
+  }
+
+  switch (systemState) {
+    case STATE_PROVISIONING:
+      portal.loop();
+      handleProvisioningSubmission();
+      break;
+
+    case STATE_WIFI_CONNECTING:
+      serviceWifiConnect();
+      break;
+
+    case STATE_MQTT_CONNECTING:
+      serviceMqttConnect();
+      mqttManager.loop();
+      break;
+
+    case STATE_RUNNING:
+      serviceRunning();
+      break;
+
+    case STATE_BOOT:
+    default:
+      break;
+  }
+
+  yield();
+}
