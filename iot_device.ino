@@ -20,8 +20,8 @@ constexpr unsigned long kWifiConnectTimeoutMs = 20000;
 constexpr uint8_t kMaxWifiAttempts = 2;
 constexpr unsigned long kStatusLogIntervalMs = 5000;
 constexpr bool kForceProvisioningModeOnBoot = false;
-constexpr unsigned long kConfigApplyRestartDelayMs = 1000;
 constexpr unsigned long kFactoryModeArmDelayMs = 10000;
+constexpr unsigned long kPortalAutoCloseMs = 45000;
 constexpr char kFactoryModeTopic[] = "iot_dev/factory_mode";
 constexpr char kFactoryModeCommand[] = "set";
 constexpr uint8_t kFactoryResetButtonPin = 14;
@@ -40,15 +40,31 @@ unsigned long wifiAttemptStartedMs = 0;
 unsigned long lastStatusLogMs = 0;
 bool factoryResetPending = false;
 String factoryResetReason;
-bool configApplyPending = false;
-unsigned long configApplyRestartAtMs = 0;
 unsigned long factoryModeArmedAtMs = 0;
+bool portalStatusSessionActive = false;
+unsigned long portalAutoCloseAtMs = 0;
 
 String buildAccessPointSsid() {
   String ssid = F("DEVICE_SETUP_");
   ssid += String(ESP.getChipId(), HEX);
   ssid.toUpperCase();
   return ssid;
+}
+
+const char *stateName(SystemState state) {
+  switch (state) {
+    case STATE_PROVISIONING:
+      return "PROVISIONING";
+    case STATE_WIFI_CONNECTING:
+      return "WIFI_CONNECTING";
+    case STATE_MQTT_CONNECTING:
+      return "MQTT_CONNECTING";
+    case STATE_RUNNING:
+      return "RUNNING";
+    case STATE_BOOT:
+    default:
+      return "BOOT";
+  }
 }
 
 void requestFactoryReset(const String &reason) {
@@ -79,10 +95,16 @@ void performFactoryReset() {
   ESP.restart();
 }
 
-void scheduleConfigApplyRestart() {
-  configApplyPending = true;
-  configApplyRestartAtMs = millis() + kConfigApplyRestartDelayMs;
-  Serial.println(F("Configuration saved. Restarting to apply new settings."));
+void closePortalSession() {
+  if (!portal.isActive()) {
+    return;
+  }
+
+  portalStatusSessionActive = false;
+  portalAutoCloseAtMs = 0;
+  Serial.println(F("Closing provisioning hotspot and switching to station mode only."));
+  portal.stop();
+  WiFi.mode(WIFI_STA);
 }
 
 void handleMqttMessage(char *topic, uint8_t *payload, unsigned int length) {
@@ -131,13 +153,15 @@ void setState(SystemState newState) {
   }
 
   systemState = newState;
-  Serial.printf("State changed to %d\n", static_cast<int>(systemState));
+  Serial.printf("State changed to %s\n", stateName(systemState));
 }
 
 void startProvisioningMode() {
   mqttManager.disconnect();
   wifiAttemptCount = 0;
   wifiAttemptStartedMs = 0;
+  portalStatusSessionActive = false;
+  portalAutoCloseAtMs = 0;
 
   const String apSsid = buildAccessPointSsid();
   if (!portal.begin(apSsid)) {
@@ -146,6 +170,10 @@ void startProvisioningMode() {
     ESP.restart();
   }
 
+  portal.showSetupPage();
+  portal.setConnectionStatus(F("Device Setup"),
+                             F("Enter Wi-Fi and MQTT details to continue."),
+                             false, false);
   Serial.printf("Provisioning portal active. Connect to '%s' and open http://%s/\n",
                 portal.accessPointSsid().c_str(), WiFi.softAPIP().toString().c_str());
   setState(STATE_PROVISIONING);
@@ -153,7 +181,18 @@ void startProvisioningMode() {
 
 void beginWifiAttempt() {
   if (wifiAttemptCount >= kMaxWifiAttempts) {
-    Serial.println(F("Wi-Fi retry limit reached, returning to provisioning mode."));
+    Serial.println(F("Wi-Fi retry limit reached."));
+    if (portalStatusSessionActive) {
+      portal.setConnectionStatus(F("Wi-Fi connection failed"),
+                                 F("Check the Wi-Fi password or SSID, then return to setup and try again."),
+                                 false, true);
+      portal.showStatusPage();
+      portalStatusSessionActive = false;
+      portalAutoCloseAtMs = 0;
+      setState(STATE_PROVISIONING);
+      return;
+    }
+
     startProvisioningMode();
     return;
   }
@@ -161,10 +200,19 @@ void beginWifiAttempt() {
   ++wifiAttemptCount;
   wifiAttemptStartedMs = millis();
 
-  WiFi.softAPdisconnect(true);
-  WiFi.mode(WIFI_STA);
   WiFi.persistent(false);
   WiFi.setAutoReconnect(true);
+  if (portalStatusSessionActive) {
+    WiFi.mode(WIFI_AP_STA);
+    portal.setConnectionStatus(
+        F("Connecting to Wi-Fi"),
+        String(F("Joining \"")) + deviceConfig.wifiSsid + F("\" (attempt ") +
+            String(wifiAttemptCount) + F("/") + String(kMaxWifiAttempts) + F(")."),
+        false, false);
+  } else {
+    WiFi.softAPdisconnect(true);
+    WiFi.mode(WIFI_STA);
+  }
   WiFi.disconnect();
   delay(100);
   WiFi.begin(deviceConfig.wifiSsid, deviceConfig.wifiPassword);
@@ -175,7 +223,6 @@ void beginWifiAttempt() {
 }
 
 void startWifiConnectionFlow() {
-  portal.stop();
   mqttManager.disconnect();
   beginWifiAttempt();
 }
@@ -183,6 +230,11 @@ void startWifiConnectionFlow() {
 void serviceWifiConnect() {
   if (WiFi.status() == WL_CONNECTED) {
     Serial.printf("Wi-Fi connected. IP address: %s\n", WiFi.localIP().toString().c_str());
+    if (portalStatusSessionActive) {
+      portal.setConnectionStatus(F("Wi-Fi connected"),
+                                 F("Wi-Fi is up. Connecting to the MQTT broker now."),
+                                 false, false, WiFi.localIP().toString());
+    }
     mqttManager.configure(deviceConfig);
     setState(STATE_MQTT_CONNECTING);
     return;
@@ -197,6 +249,12 @@ void serviceWifiConnect() {
   if (millis() - lastStatusLogMs >= kStatusLogIntervalMs) {
     lastStatusLogMs = millis();
     Serial.println(F("Waiting for Wi-Fi connection..."));
+    if (portalStatusSessionActive) {
+      portal.setConnectionStatus(
+          F("Connecting to Wi-Fi"),
+          String(F("Still trying to join \"")) + deviceConfig.wifiSsid + F("\"."),
+          false, false);
+    }
   }
 }
 
@@ -225,6 +283,14 @@ void serviceMqttConnect() {
     Serial.printf("Subscribed to MQTT topic '%s'\n", kFactoryModeTopic);
     factoryModeArmedAtMs = millis() + kFactoryModeArmDelayMs;
     Serial.printf("Factory mode MQTT command will arm in %lu ms\n", kFactoryModeArmDelayMs);
+    if (portalStatusSessionActive) {
+      portal.setConnectionStatus(
+          F("Device connected"),
+          F("Wi-Fi and MQTT are connected. You can disconnect from this hotspot now."),
+          true, false, WiFi.localIP().toString());
+      portal.showStatusPage();
+      portalAutoCloseAtMs = millis() + kPortalAutoCloseMs;
+    }
     setState(STATE_RUNNING);
     return;
   }
@@ -233,18 +299,35 @@ void serviceMqttConnect() {
     lastStatusLogMs = millis();
     Serial.printf("Waiting for MQTT broker %s:%u (state=%d)\n", deviceConfig.mqttBroker,
                   deviceConfig.mqttPort, mqttManager.state());
+    if (portalStatusSessionActive) {
+      portal.setConnectionStatus(
+          F("Connecting to MQTT"),
+          String(F("Wi-Fi is connected. Waiting for broker ")) + deviceConfig.mqttBroker +
+              F(":") + String(deviceConfig.mqttPort) + F("."),
+          false, false, WiFi.localIP().toString());
+    }
   }
 }
 
 void serviceRunning() {
   if (WiFi.status() != WL_CONNECTED) {
     Serial.println(F("Wi-Fi disconnected. Restarting Wi-Fi connection flow."));
+    if (portalStatusSessionActive) {
+      portal.setConnectionStatus(F("Wi-Fi disconnected"),
+                                 F("The device lost Wi-Fi and is reconnecting."),
+                                 false, false);
+    }
     startWifiConnectionFlow();
     return;
   }
 
   if (!mqttManager.connected()) {
     Serial.println(F("MQTT disconnected. Reconnecting."));
+    if (portalStatusSessionActive) {
+      portal.setConnectionStatus(F("MQTT disconnected"),
+                                 F("Wi-Fi is still connected. Reconnecting to MQTT."),
+                                 false, false, WiFi.localIP().toString());
+    }
     setState(STATE_MQTT_CONNECTING);
     return;
   }
@@ -274,7 +357,13 @@ void handleProvisioningSubmission() {
   deviceConfig = verifiedConfig;
   Serial.printf("Configuration saved for SSID '%s' and MQTT broker '%s:%u'\n",
                 deviceConfig.wifiSsid, deviceConfig.mqttBroker, deviceConfig.mqttPort);
-  scheduleConfigApplyRestart();
+  portalStatusSessionActive = true;
+  portalAutoCloseAtMs = 0;
+  portal.showStatusPage();
+  portal.setConnectionStatus(F("Configuration saved"),
+                             F("Keeping the hotspot open while the device joins Wi-Fi and MQTT."),
+                             false, false);
+  startWifiConnectionFlow();
 }
 
 }  // namespace
@@ -300,6 +389,8 @@ void setup() {
   if (!kForceProvisioningModeOnBoot && configManager.load(deviceConfig)) {
     Serial.printf("Loaded saved config. SSID='%s', MQTT='%s:%u'\n", deviceConfig.wifiSsid,
                   deviceConfig.mqttBroker, deviceConfig.mqttPort);
+    portalStatusSessionActive = false;
+    portalAutoCloseAtMs = 0;
     startWifiConnectionFlow();
   } else {
     if (kForceProvisioningModeOnBoot) {
@@ -312,6 +403,10 @@ void setup() {
 }
 
 void loop() {
+  if (portal.isActive()) {
+    portal.loop();
+  }
+
   resetManager.poll();
   if (resetManager.consumeFactoryResetRequest()) {
     requestFactoryReset(F("Physical button hold"));
@@ -322,18 +417,18 @@ void loop() {
     return;
   }
 
-  if (configApplyPending &&
-      static_cast<long>(millis() - configApplyRestartAtMs) >= 0) {
-    configApplyPending = false;
-    Serial.println(F("Rebooting now to apply provisioned configuration."));
-    delay(200);
-    ESP.restart();
-    return;
+  if (portal.consumeFinishRequest()) {
+    closePortalSession();
+  }
+
+  if (portalStatusSessionActive && portalAutoCloseAtMs != 0 &&
+      static_cast<long>(millis() - portalAutoCloseAtMs) >= 0) {
+    Serial.println(F("Auto-closing provisioning hotspot after successful handoff."));
+    closePortalSession();
   }
 
   switch (systemState) {
     case STATE_PROVISIONING:
-      portal.loop();
       handleProvisioningSubmission();
       break;
 

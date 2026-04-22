@@ -84,24 +84,64 @@ const char kSetupPage[] PROGMEM = R"HTML(
 </html>
 )HTML";
 
-const char kSavedPage[] PROGMEM = R"HTML(
+const char kStatusPage[] PROGMEM = R"HTML(
 <!DOCTYPE html>
 <html lang="en">
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width,initial-scale=1">
-  <title>Saved</title>
+  <title>Device Status</title>
   <style>
     body{font-family:Arial,sans-serif;background:#f3f6fb;color:#1f2937;padding:24px}
     .card{max-width:520px;margin:0 auto;background:#fff;border-radius:14px;padding:24px;box-shadow:0 16px 36px rgba(15,23,42,.08)}
+    .meta{font-size:14px;color:#475569;margin-top:12px}
+    .ok{color:#166534}
+    .err{color:#b91c1c}
+    button,a{display:inline-block;margin-top:14px;padding:12px 16px;border-radius:10px;text-decoration:none;font-weight:700;border:none;cursor:pointer}
+    button{background:#0f766e;color:#fff}
+    a{background:#e2e8f0;color:#0f172a}
   </style>
 </head>
 <body>
   <div class="card">
-    <h1>Settings saved</h1>
-    <p>The device is leaving setup mode and will try to connect to your Wi-Fi and MQTT broker now.</p>
-    <p>You can close this page.</p>
+    <h1 id="title">Applying settings</h1>
+    <p id="message">Starting connection sequence...</p>
+    <p class="meta" id="networkInfo"></p>
+    <p class="meta" id="apInfo"></p>
+    <button id="finishButton" type="button" style="display:none" onclick="finishSetup()">Disconnect Hotspot</button>
+    <a id="setupLink" href="/setup" style="display:none">Return to Setup</a>
   </div>
+  <script>
+    async function refreshStatus(){
+      try{
+        const response=await fetch('/status',{cache:'no-store'});
+        const status=await response.json();
+        document.getElementById('title').textContent=status.title || 'Device Status';
+        document.getElementById('message').textContent=status.message || '';
+        document.getElementById('message').className=status.error ? 'err' : (status.done ? 'ok' : '');
+        document.getElementById('networkInfo').textContent=status.station_ip ? `Device IP on Wi-Fi: ${status.station_ip}` : '';
+        document.getElementById('apInfo').textContent=status.ap_ssid ? `Hotspot: ${status.ap_ssid} (${status.ap_ip})` : '';
+        document.getElementById('finishButton').style.display=status.done ? 'inline-block' : 'none';
+        document.getElementById('setupLink').style.display=status.error ? 'inline-block' : 'none';
+      }catch(error){
+        document.getElementById('message').textContent='Lost contact with the device. Reconnect to the hotspot or power-cycle the device.';
+        document.getElementById('message').className='err';
+      }
+    }
+
+    async function finishSetup(){
+      const button=document.getElementById('finishButton');
+      button.disabled=true;
+      try{
+        await fetch('/finish',{cache:'no-store'});
+      }catch(error){}
+      document.getElementById('message').textContent='Hotspot is closing. Reconnect your phone or laptop to your normal Wi-Fi.';
+      document.getElementById('message').className='ok';
+    }
+
+    refreshStatus();
+    setInterval(refreshStatus,1000);
+  </script>
 </body>
 </html>
 )HTML";
@@ -122,6 +162,13 @@ ProvisioningPortal::ProvisioningPortal()
       accessPointSsid_(),
       active_(false),
       hasPendingConfig_(false),
+      finishRequested_(false),
+      pageMode_(PageMode::kSetup),
+      statusTitle_(),
+      statusMessage_(),
+      stationIp_(),
+      statusDone_(false),
+      statusError_(false),
       pendingConfig_() {
   device_config::clear(pendingConfig_);
 }
@@ -131,6 +178,13 @@ bool ProvisioningPortal::begin(const String &apSsid) {
 
   accessPointSsid_ = apSsid;
   hasPendingConfig_ = false;
+  finishRequested_ = false;
+  pageMode_ = PageMode::kSetup;
+  statusTitle_ = F("Device Setup");
+  statusMessage_ = F("Enter Wi-Fi and MQTT details.");
+  stationIp_ = "";
+  statusDone_ = false;
+  statusError_ = false;
   device_config::clear(pendingConfig_);
 
   WiFi.persistent(false);
@@ -163,6 +217,8 @@ void ProvisioningPortal::stop() {
   active_ = false;
 }
 
+bool ProvisioningPortal::isActive() const { return active_; }
+
 void ProvisioningPortal::loop() {
   if (!active_) {
     return;
@@ -181,11 +237,42 @@ device_config::DeviceConfig ProvisioningPortal::takeSubmittedConfig() {
 
 String ProvisioningPortal::accessPointSsid() const { return accessPointSsid_; }
 
+void ProvisioningPortal::showSetupPage() {
+  pageMode_ = PageMode::kSetup;
+}
+
+void ProvisioningPortal::showStatusPage() {
+  pageMode_ = PageMode::kStatus;
+}
+
+ProvisioningPortal::PageMode ProvisioningPortal::pageMode() const {
+  return pageMode_;
+}
+
+void ProvisioningPortal::setConnectionStatus(const String &title,
+                                             const String &message, bool done,
+                                             bool error,
+                                             const String &stationIp) {
+  statusTitle_ = title;
+  statusMessage_ = message;
+  statusDone_ = done;
+  statusError_ = error;
+  stationIp_ = stationIp;
+}
+
+bool ProvisioningPortal::consumeFinishRequest() {
+  const bool requested = finishRequested_;
+  finishRequested_ = false;
+  return requested;
+}
+
 void ProvisioningPortal::configureRoutes() {
   server_.on("/", HTTP_GET, [this]() { handlePortalPage(); });
   server_.on("/scan", HTTP_GET, [this]() { handleScan(); });
   server_.on("/save", HTTP_POST, [this]() { handleSave(); });
   server_.on("/status", HTTP_GET, [this]() { handleStatus(); });
+  server_.on("/finish", HTTP_ANY, [this]() { handleFinish(); });
+  server_.on("/setup", HTTP_GET, [this]() { handleSetup(); });
 
   server_.on("/generate_204", HTTP_GET, [this]() { handlePortalPage(); });
   server_.on("/hotspot-detect.html", HTTP_GET, [this]() { handlePortalPage(); });
@@ -197,6 +284,11 @@ void ProvisioningPortal::configureRoutes() {
 }
 
 void ProvisioningPortal::handlePortalPage() {
+  if (pageMode_ == PageMode::kStatus) {
+    server_.send_P(200, PSTR("text/html"), kStatusPage);
+    return;
+  }
+
   server_.send_P(200, PSTR("text/html"), kSetupPage);
 }
 
@@ -274,17 +366,45 @@ void ProvisioningPortal::handleSave() {
   pendingConfig_.mqttPort = static_cast<uint16_t>(mqttPort);
   pendingConfig_.provisioned = true;
   hasPendingConfig_ = true;
+  showStatusPage();
+  setConnectionStatus(F("Configuration saved"),
+                      F("Keeping the hotspot open while the device connects to Wi-Fi and MQTT."),
+                      false, false);
 
-  server_.send_P(200, PSTR("text/html"), kSavedPage);
+  server_.send_P(200, PSTR("text/html"), kStatusPage);
 }
 
 void ProvisioningPortal::handleStatus() {
-  String payload = "{\"mode\":\"provisioning\",\"ap_ssid\":\"";
+  String payload = "{\"mode\":\"";
+  payload += (pageMode_ == PageMode::kStatus) ? F("status") : F("setup");
+  payload += F("\",\"title\":\"");
+  payload += jsonEscape(statusTitle_);
+  payload += F("\",\"message\":\"");
+  payload += jsonEscape(statusMessage_);
+  payload += F("\",\"done\":");
+  payload += statusDone_ ? F("true") : F("false");
+  payload += F(",\"error\":");
+  payload += statusError_ ? F("true") : F("false");
+  payload += F(",\"station_ip\":\"");
+  payload += jsonEscape(stationIp_);
+  payload += F("\",\"ap_ssid\":\"");
   payload += jsonEscape(accessPointSsid_);
-  payload += "\",\"ap_ip\":\"";
+  payload += F("\",\"ap_ip\":\"");
   payload += WiFi.softAPIP().toString();
-  payload += "\"}";
+  payload += F("\"}");
   server_.send(200, F("application/json"), payload);
+}
+
+void ProvisioningPortal::handleFinish() {
+  finishRequested_ = true;
+  server_.send(200, F("application/json"), F("{\"ok\":true}"));
+}
+
+void ProvisioningPortal::handleSetup() {
+  showSetupPage();
+  setConnectionStatus(F("Device Setup"), F("Enter Wi-Fi and MQTT details."), false,
+                      false);
+  server_.send_P(200, PSTR("text/html"), kSetupPage);
 }
 
 String ProvisioningPortal::jsonEscape(const String &input) const {
